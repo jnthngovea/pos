@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: FrixPOS — Backend
- * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual y stock sincronizado entre varias cajas (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual y /stock, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
- * Version: 1.24
+ * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual, stock sincronizado entre varias cajas (solo pago) y sincronización en tiempo real vía Ably entre dispositivos de una misma cuenta premium (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual, /stock y /ably-token, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
+ * Version: 1.25
  * Author: FrixPOS
  * Requires PHP: 7.4
  *
@@ -449,6 +449,12 @@ add_action( 'rest_api_init', function () {
 		'methods'             => 'POST',
 		'callback'            => 'punto_api_stock_mover',
 		'permission_callback' => '__return_true',
+	) );
+
+	register_rest_route( 'punto/v1', '/ably-token', array(
+		'methods'             => 'POST',
+		'callback'            => 'punto_api_ably_token',
+		'permission_callback' => '__return_true', // la autorización se hace adentro, con el Bearer token de cuenta
 	) );
 
 	register_rest_route(
@@ -1415,6 +1421,84 @@ function punto_api_stock_listar( $request ) {
 }
 
 /* ==========================================================================
+ * 3d-quater. SINCRONIZACIÓN EN TIEMPO REAL — Ably (v1.25)
+ * ==========================================================================
+ * Este endpoint SOLO entrega un token de Ably de corta vida (1 hora), con
+ * permiso restringido al canal de UN negocio. Nunca pasa datos de negocio ni
+ * la API Key completa — esa vive solo en wp_options (Punto → Tiempo real),
+ * nunca en el tema ni en el cliente.
+ *
+ * Ably en sí NO reemplaza a /stock, /respaldo, etc.: solo avisa "algo cambió"
+ * entre los dispositivos de la MISMA cuenta para que refresquen al instante
+ * en vez de esperar el próximo sync manual. El dato de verdad se sigue
+ * pidiendo por la API de siempre — así no hay dos caminos distintos con la
+ * misma lógica de negocio, ni el cliente puede inventarse un dato con solo
+ * publicar un mensaje en el canal.
+ *
+ * Se pide el token con un TokenRequest "sin firmar" (Basic Auth con la key
+ * completa en vez de calcular el mac/nonce a mano) — así no hace falta el SDK
+ * de Ably ni Composer, que en hosting compartido (Hostinger y similares)
+ * suele no estar disponible. Ver la Ably TokenRequest spec, sección de
+ * autenticación no firmada.
+ *
+ * Mismo candado que /stock: exige negocio activo (feature paga). El canal es
+ * "negocio-{id}", no el id de cuenta — dos teléfonos de la misma cuenta ya
+ * comparten negocio_id sin tener que reactivar ningún código.
+ */
+function punto_api_ably_token( $request ) {
+	$cuenta = punto_cuenta_por_token( punto_token_de_request( $request ) );
+	if ( ! $cuenta ) {
+		return new WP_REST_Response( array( 'message' => 'Token de cuenta inválido. Inicia sesión de nuevo.' ), 401 );
+	}
+	$negocio_id = punto_negocio_id_de_cuenta( $cuenta->ID );
+	if ( ! $negocio_id ) {
+		return new WP_REST_Response( array( 'message' => 'La sincronización en tiempo real requiere un negocio activo.', 'requiere_activacion' => true ), 403 );
+	}
+
+	$api_key = trim( (string) get_option( 'punto_ably_api_key' ) );
+	if ( '' === $api_key || false === strpos( $api_key, ':' ) ) {
+		return new WP_REST_Response( array( 'message' => 'Sincronización en tiempo real no configurada en el servidor.' ), 500 );
+	}
+	list( $key_name, ) = explode( ':', $api_key, 2 );
+
+	// Un solo canal por negocio, con los tres permisos que necesita: publicar sus propios
+	// cambios, escuchar los de otros dispositivos de la misma cuenta, y presence (para saber
+	// qué dispositivos están conectados ahora mismo).
+	$canal      = 'negocio-' . $negocio_id;
+	$capability = wp_json_encode( array( $canal => array( 'publish', 'subscribe', 'presence' ) ) );
+
+	$respuesta = wp_remote_post(
+		'https://main.realtime.ably.net/keys/' . rawurlencode( $key_name ) . '/requestToken',
+		array(
+			'headers' => array(
+				'Authorization' => 'Basic ' . base64_encode( $api_key ),
+				'Content-Type'  => 'application/json',
+			),
+			'body'    => wp_json_encode(
+				array(
+					'keyName'    => $key_name,
+					'capability' => $capability,
+					'clientId'   => 'cuenta-' . $cuenta->ID,
+					'ttl'        => 3600000, // 1 hora en ms — Ably JS pide uno nuevo solo (authUrl) antes de que este venza
+				)
+			),
+			'timeout' => 10,
+		)
+	);
+
+	if ( is_wp_error( $respuesta ) ) {
+		return new WP_REST_Response( array( 'message' => 'No se pudo contactar el servicio de tiempo real.' ), 502 );
+	}
+	$datos = json_decode( wp_remote_retrieve_body( $respuesta ), true );
+	if ( 200 !== wp_remote_retrieve_response_code( $respuesta ) || empty( $datos['token'] ) ) {
+		return new WP_REST_Response( array( 'message' => 'El servicio de tiempo real rechazó la solicitud.' ), 502 );
+	}
+
+	// $datos ya es el TokenDetails que espera el cliente Ably (token, expires, issued, ...).
+	return new WP_REST_Response( $datos, 200 );
+}
+
+/* ==========================================================================
  * 3e. CONTABILIDAD MENSUAL (v1.6)
  * ==========================================================================
  * Mismo patrón que el respaldo (3d), pero por MES en vez de por día, y sin
@@ -2051,6 +2135,7 @@ add_action( 'admin_menu', function () {
 	add_submenu_page( 'punto', 'Limpiar datos de prueba', 'Limpiar datos', 'manage_options', 'punto-limpiar', 'punto_admin_limpiar' );
 	add_submenu_page( 'punto', 'Solicitudes', 'Solicitudes', 'manage_options', 'punto-solicitudes', 'punto_admin_solicitudes' );
 	add_submenu_page( 'punto', 'Diagnóstico de correo', 'Correo', 'manage_options', 'punto-correo', 'punto_admin_correo' );
+	add_submenu_page( 'punto', 'Sincronización en tiempo real', 'Tiempo real', 'manage_options', 'punto-tiempo-real', 'punto_admin_tiempo_real' );
 } );
 
 /**
@@ -2110,6 +2195,62 @@ function punto_admin_correo() {
 			<?php wp_nonce_field( 'punto_correo' ); ?>
 			<input type="email" name="punto_test_mail" class="regular-text" placeholder="tucorreo@gmail.com" required>
 			<button class="button button-primary">Enviar prueba</button>
+		</form>
+	</div>
+	<?php
+}
+
+/**
+ * Sincronización en tiempo real (Ably) — v1.25. La API Key completa se guarda SOLO aquí
+ * (wp_options), nunca en el tema hijo ni en el cliente: page-pos.php solo recibe, vía
+ * /ably-token, un token de corta vida acotado al canal de un único negocio (ver
+ * punto_api_ably_token). Un campo vacío al guardar NO borra la key ya configurada —
+ * es la forma de dejar este formulario sin valor visible después de guardarla una vez.
+ */
+function punto_admin_tiempo_real() {
+	$aviso = '';
+
+	if ( isset( $_POST['punto_ably_guardar'] ) && check_admin_referer( 'punto_ably' ) ) {
+		$valor = trim( wp_unslash( $_POST['punto_ably_api_key'] ) );
+		if ( '' === $valor ) {
+			// campo vacío = no tocar lo que ya había guardado
+		} elseif ( false === strpos( $valor, ':' ) ) {
+			$aviso = '<div class="notice notice-error"><p>Esa no parece una API Key de Ably válida — debe tener el formato <code>appId.keyId:keySecret</code>, tal como la muestra el panel de Ably.</p></div>';
+		} else {
+			update_option( 'punto_ably_api_key', $valor );
+			$aviso = '<div class="notice notice-success"><p>Guardado.</p></div>';
+		}
+	}
+
+	$actual = trim( (string) get_option( 'punto_ably_api_key' ) );
+	$oculto = $actual ? ( substr( $actual, 0, 6 ) . '••••••••' . substr( $actual, -4 ) ) : '';
+	?>
+	<div class="wrap">
+		<h1>Sincronización en tiempo real (Ably)</h1>
+		<?php echo $aviso; // phpcs:ignore WordPress.Security.EscapeOutput ?>
+
+		<p>Permite que el POS de una cuenta <b>premium</b> (con negocio activo) se mantenga
+		sincronizado al instante entre varios dispositivos — PC, tablet, teléfono — en vez de
+		esperar a la próxima sincronización manual. Solo aplica a cuentas con código activado;
+		sin código, el POS sigue funcionando exactamente igual que ahora.</p>
+
+		<p>La API Key completa de Ably se guarda aquí, en el servidor, y <b>nunca</b> se manda
+		al teléfono ni al navegador: el plugin solo entrega tokens temporales (1 hora) con
+		permiso sobre el canal de un único negocio a la vez. Consíguela en
+		<a href="https://ably.com/accounts" target="_blank" rel="noopener">tu cuenta de Ably</a>
+		→ tu app → API Keys (la que tenga los permisos Publish/Subscribe/Presence/Token Request).</p>
+
+		<?php if ( $actual ) : ?>
+			<p>Configurada actualmente: <code><?php echo esc_html( $oculto ); ?></code></p>
+		<?php else : ?>
+			<p><em>Todavía no hay ninguna key guardada — la sincronización en tiempo real está
+			apagada hasta que pegues una aquí.</em></p>
+		<?php endif; ?>
+
+		<form method="post">
+			<?php wp_nonce_field( 'punto_ably' ); ?>
+			<input type="text" name="punto_ably_api_key" class="regular-text" style="font-family:monospace" placeholder="appId.keyId:keySecret" autocomplete="off">
+			<button class="button button-primary" name="punto_ably_guardar" value="1">Guardar</button>
 		</form>
 	</div>
 	<?php
