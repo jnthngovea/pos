@@ -7727,7 +7727,7 @@ function emitCambio(tipo,payload){
   cambiosPendientes.push({tipo,payload,origen:idDispositivo()});
   schedulePersist(true);
   if(ablyChannel){
-    try{ ablyChannel.publish('cambio',{tipo,payload}); }catch(e){}
+    try{ ablyChannel.publish('cambio',{tipo,payload}); }catch(e){ console.error('[FrixPOS/tiempo real] no se pudo publicar en vivo (queda igual en la cola de /cambios)',e); }
   }
   flushCambiosPendientes();
 }
@@ -7747,11 +7747,15 @@ async function flushCambiosPendientes(){
         method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+puntoAccountToken},
         body:JSON.stringify(c)
       });
-      if(!res.ok) break;
+      if(!res.ok){
+        const detalle=await res.text().catch(()=>'');
+        console.error('[FrixPOS/tiempo real] /cambios rechazó el envío, status '+res.status+' — queda en cola para reintentar',detalle);
+        break;
+      }
       cambiosPendientes.shift();
     }
     schedulePersist(true);
-  }catch(e){ /* sin internet — se reintenta en el próximo intento, sin bloquear nada */ }
+  }catch(e){ console.error('[FrixPOS/tiempo real] no se pudo mandar /cambios (¿sin internet?) — se reintenta solo',e); }
   syncingCambios=false;
 }
 
@@ -7761,12 +7765,12 @@ async function ponerseAlDiaConCambios(){
     const qs=cambiosSyncDesde?('?desde='+encodeURIComponent(cambiosSyncDesde)):'';
     const res=await fetch('/wp-json/punto/v1/cambios'+qs,{ headers:{'Authorization':'Bearer '+puntoAccountToken} });
     const data=await res.json().catch(()=>null);
-    if(!res.ok || !data || !data.ok) return;
+    if(!res.ok || !data || !data.ok){ console.error('[FrixPOS/tiempo real] /cambios (ponerse al día) falló, status '+res.status,data); return; }
     // el propio origen se salta: ya lo tenemos (lo publicamos nosotros mismos).
     (data.cambios||[]).forEach(c=>{ if(c.origen!==idDispositivo()) aplicarCambioRemoto(c.tipo,c.payload); });
     if(data.ultimo_id) cambiosSyncDesde=data.ultimo_id;
     schedulePersist(true);
-  }catch(e){ /* sin internet — se reintenta en el próximo intento */ }
+  }catch(e){ console.error('[FrixPOS/tiempo real] no se pudo pedir /cambios (¿sin internet?) — se reintenta solo',e); }
 }
 
 // Aplica un cambio llegado de OTRO dispositivo de la misma cuenta (por Ably en vivo, o al
@@ -7831,9 +7835,12 @@ function aplicarCambioRemoto(tipo,payload){
 // una conexión abierta — así se puede llamar varias veces sin cuidado (login, boot,
 // reconexión) sin abrir conexiones duplicadas.
 function conectarTiempoReal(){
-  if(!esNegocioActivo() || !puntoAccountToken || !puntoNegocioId) return;
+  // console.debug, no console.warn/error: estas 3 salidas son normales todo el tiempo (cuenta
+  // gratis/trial, sin sesión, o ya conectado) — solo sirven para diagnosticar a propósito con
+  // la consola abierta, no deben verse como que algo está roto.
+  if(!esNegocioActivo() || !puntoAccountToken || !puntoNegocioId){ console.debug('[FrixPOS/tiempo real] no aplica: negocio activo='+esNegocioActivo()+' cuenta='+(!!puntoAccountToken)+' negocioId='+puntoNegocioId); return; }
   if(ablyClient) return;
-  if(typeof Ably==='undefined') return;
+  if(typeof Ably==='undefined'){ console.warn('[FrixPOS/tiempo real] el SDK de Ably no cargó (astra-child/pos/ably.min.js) — revisa que el archivo exista en el tema y que la ruta del <script src> responda 200.'); return; }
   try{
     ablyClient=new Ably.Realtime({
       authUrl:'/wp-json/punto/v1/ably-token',
@@ -7843,12 +7850,19 @@ function conectarTiempoReal(){
     });
     ablyChannel=ablyClient.channels.get('negocio-'+puntoNegocioId);
     ablyChannel.subscribe('cambio',(msg)=>{
-      try{ aplicarCambioRemoto(msg.data.tipo,msg.data.payload); }catch(e){}
+      try{ aplicarCambioRemoto(msg.data.tipo,msg.data.payload); }catch(e){ console.error('[FrixPOS/tiempo real] error aplicando cambio remoto',e,msg&&msg.data); }
     });
     // cada (re)conexión es también el momento de ponerse al día por si acaso: Ably cubre huecos
     // cortos solo, /cambios cubre cualquier hueco sin importar cuánto duró.
-    ablyClient.connection.on('connected',ponerseAlDiaConCambios);
-  }catch(e){ ablyClient=null; ablyChannel=null; }
+    ablyClient.connection.on('connected',()=>{ console.debug('[FrixPOS/tiempo real] conectado, canal negocio-'+puntoNegocioId); ponerseAlDiaConCambios(); });
+    // visibles a propósito (a diferencia del resto, que calla y reintenta solo): son la forma
+    // más rápida de saber POR QUÉ no está conectando cuando alguien reporta "no funciona" —
+    // 'failed' casi siempre es el token rechazado (ver /ably-token: negocio activo, API Key mal
+    // guardada en Punto → Tiempo real, o el header Authorization filtrado por Apache en hosting
+    // compartido — mismo problema ya conocido de /sync, ver el README del plugin).
+    ablyClient.connection.on('failed',(sc)=>console.error('[FrixPOS/tiempo real] conexión falló',sc&&sc.reason));
+    ablyClient.connection.on('suspended',(sc)=>console.warn('[FrixPOS/tiempo real] conexión suspendida (varios reintentos fallidos)',sc&&sc.reason));
+  }catch(e){ console.error('[FrixPOS/tiempo real] no se pudo iniciar Ably',e); ablyClient=null; ablyChannel=null; }
 }
 function desconectarTiempoReal(){
   if(ablyClient){ try{ ablyClient.close(); }catch(e){} }
