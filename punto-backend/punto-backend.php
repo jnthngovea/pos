@@ -2,7 +2,7 @@
 /**
  * Plugin Name: FrixPOS — Backend
  * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual, stock sincronizado entre varias cajas (solo pago) y sincronización en tiempo real vía Ably entre dispositivos de una misma cuenta premium, con bitácora de cambios como red de seguridad para cuando un dispositivo estuvo desconectado (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual, /stock, /ably-token y /cambios, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
- * Version: 1.26
+ * Version: 1.27
  * Author: FrixPOS
  * Requires PHP: 7.4
  *
@@ -1458,7 +1458,7 @@ function punto_api_stock_listar( $request ) {
 }
 
 /* ==========================================================================
- * 3d-quater. SINCRONIZACIÓN EN TIEMPO REAL — Ably (v1.25)
+ * 3d-quater. SINCRONIZACIÓN EN TIEMPO REAL — Ably (v1.27)
  * ==========================================================================
  * Este endpoint SOLO entrega un token de Ably de corta vida (1 hora), con
  * permiso restringido al canal de UN negocio. Nunca pasa datos de negocio ni
@@ -1472,16 +1472,45 @@ function punto_api_stock_listar( $request ) {
  * misma lógica de negocio, ni el cliente puede inventarse un dato con solo
  * publicar un mensaje en el canal.
  *
- * Se pide el token con un TokenRequest "sin firmar" (Basic Auth con la key
- * completa en vez de calcular el mac/nonce a mano) — así no hace falta el SDK
- * de Ably ni Composer, que en hosting compartido (Hostinger y similares)
- * suele no estar disponible. Ver la Ably TokenRequest spec, sección de
- * autenticación no firmada.
+ * v1.27 — CAMBIO IMPORTANTE: el token se firma LOCAL (JWT, HMAC-SHA256 con
+ * hash_hmac, cero librerías), no se le pide a Ably por HTTP. La v1.25
+ * original llamaba a wp_remote_post() contra Ably — en hosting compartido
+ * (Hostinger y similares) esa conexión SALIENTE desde PHP suele estar
+ * bloqueada o no responder, y el síntoma es específico: /ably-token daba
+ * 502 (Cloudflare "origin no respondió") en TODOS los casos, incluso con
+ * negocio activo y API Key bien puesta — nada que ver con el dato, es la
+ * conexión de salida la que nunca llegaba. Firmar el JWT acá adentro no
+ * necesita red para nada: es aritmética con la API Key que ya está guardada
+ * en este servidor. Ver "Ably Pub/Sub | JSON Web Tokens (JWTs)" en los docs
+ * de Ably para el formato exacto (claim x-ably-capability, etc.).
  *
  * Mismo candado que /stock: exige negocio activo (feature paga). El canal es
  * "negocio-{id}", no el id de cuenta — dos teléfonos de la misma cuenta ya
  * comparten negocio_id sin tener que reactivar ningún código.
  */
+function punto_base64url( $datos_binarios ) {
+	return rtrim( strtr( base64_encode( $datos_binarios ), '+/', '-_' ), '=' );
+}
+
+/**
+ * JWT firmado para Ably. $key_name es la parte antes de los ':' de la API Key ("appId.keyId"),
+ * $key_secret la parte de después — nunca se manda ninguna de las dos al cliente, solo el JWT ya
+ * firmado, que Ably puede validar pero de donde no se puede reconstruir la key.
+ */
+function punto_ably_jwt( $key_name, $key_secret, $capability_json, $client_id, $ttl_segundos ) {
+	$ahora   = time();
+	$header  = array( 'typ' => 'JWT', 'alg' => 'HS256', 'kid' => $key_name );
+	$claims  = array(
+		'iat'               => $ahora,
+		'exp'               => $ahora + $ttl_segundos,
+		'x-ably-capability' => $capability_json,
+		'x-ably-clientId'   => $client_id,
+	);
+	$sin_firmar = punto_base64url( wp_json_encode( $header ) ) . '.' . punto_base64url( wp_json_encode( $claims ) );
+	$firma      = hash_hmac( 'sha256', $sin_firmar, $key_secret, true );
+	return $sin_firmar . '.' . punto_base64url( $firma );
+}
+
 function punto_api_ably_token( $request ) {
 	$cuenta = punto_cuenta_por_token( punto_token_de_request( $request ) );
 	if ( ! $cuenta ) {
@@ -1496,7 +1525,7 @@ function punto_api_ably_token( $request ) {
 	if ( '' === $api_key || false === strpos( $api_key, ':' ) ) {
 		return new WP_REST_Response( array( 'message' => 'Sincronización en tiempo real no configurada en el servidor.' ), 500 );
 	}
-	list( $key_name, ) = explode( ':', $api_key, 2 );
+	list( $key_name, $key_secret ) = explode( ':', $api_key, 2 );
 
 	// Un solo canal por negocio, con los tres permisos que necesita: publicar sus propios
 	// cambios, escuchar los de otros dispositivos de la misma cuenta, y presence (para saber
@@ -1504,35 +1533,11 @@ function punto_api_ably_token( $request ) {
 	$canal      = 'negocio-' . $negocio_id;
 	$capability = wp_json_encode( array( $canal => array( 'publish', 'subscribe', 'presence' ) ) );
 
-	$respuesta = wp_remote_post(
-		'https://main.realtime.ably.net/keys/' . rawurlencode( $key_name ) . '/requestToken',
-		array(
-			'headers' => array(
-				'Authorization' => 'Basic ' . base64_encode( $api_key ),
-				'Content-Type'  => 'application/json',
-			),
-			'body'    => wp_json_encode(
-				array(
-					'keyName'    => $key_name,
-					'capability' => $capability,
-					'clientId'   => 'cuenta-' . $cuenta->ID,
-					'ttl'        => 3600000, // 1 hora en ms — Ably JS pide uno nuevo solo (authUrl) antes de que este venza
-				)
-			),
-			'timeout' => 10,
-		)
-	);
+	$jwt = punto_ably_jwt( $key_name, $key_secret, $capability, 'cuenta-' . $cuenta->ID, HOUR_IN_SECONDS );
 
-	if ( is_wp_error( $respuesta ) ) {
-		return new WP_REST_Response( array( 'message' => 'No se pudo contactar el servicio de tiempo real.' ), 502 );
-	}
-	$datos = json_decode( wp_remote_retrieve_body( $respuesta ), true );
-	if ( 200 !== wp_remote_retrieve_response_code( $respuesta ) || empty( $datos['token'] ) ) {
-		return new WP_REST_Response( array( 'message' => 'El servicio de tiempo real rechazó la solicitud.' ), 502 );
-	}
-
-	// $datos ya es el TokenDetails que espera el cliente Ably (token, expires, issued, ...).
-	return new WP_REST_Response( $datos, 200 );
+	// {token: ...} — formato que ably-js ya sabe leer desde authUrl (misma forma que un
+	// TokenDetails), sin depender de un Content-Type especial ni de una respuesta "en crudo".
+	return new WP_REST_Response( array( 'token' => $jwt ), 200 );
 }
 
 /* ==========================================================================
@@ -2386,9 +2391,11 @@ function punto_admin_tiempo_real() {
 
 		<p>La API Key completa de Ably se guarda aquí, en el servidor, y <b>nunca</b> se manda
 		al teléfono ni al navegador: el plugin solo entrega tokens temporales (1 hora) con
-		permiso sobre el canal de un único negocio a la vez. Consíguela en
+		permiso sobre el canal de un único negocio a la vez — se firma en este mismo servidor,
+		sin llamar a Ably por internet (así funciona aunque tu hosting bloquee conexiones
+		salientes, algo común en hosting compartido). Consíguela en
 		<a href="https://ably.com/accounts" target="_blank" rel="noopener">tu cuenta de Ably</a>
-		→ tu app → API Keys (la que tenga los permisos Publish/Subscribe/Presence/Token Request).</p>
+		→ tu app → API Keys (la que tenga los permisos Publish/Subscribe/Presence).</p>
 
 		<?php if ( $actual ) : ?>
 			<p>Configurada actualmente: <code><?php echo esc_html( $oculto ); ?></code></p>
