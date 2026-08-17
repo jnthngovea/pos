@@ -1091,6 +1091,14 @@
 </div>
 
 <!-- FRIXPOS:BODY-FIN -->
+<!-- Ably (mensajería en tiempo real), vendorizado en el propio tema en vez de cargarlo desde
+     el CDN de Ably: este POS es un solo archivo autocontenido a propósito (ver sw.js) para que
+     siga instalable/offline aunque el CDN de un tercero esté caído. v2.27.0, bajado el
+     2026-08-17 desde https://cdn.ably.com/lib/ably.min-2.js — para actualizarlo, repetir esa
+     descarga y reemplazar astra-child/pos/ably.min.js. Si este script no carga (bloqueado,
+     archivo faltante, etc.) el resto del POS sigue funcionando igual: todo lo que lo usa
+     comprueba primero que exista `Ably` en window. -->
+<script src="<?php echo esc_url( get_stylesheet_directory_uri() . '/pos/ably.min.js' ); ?>"></script>
 <!-- FRIXPOS:SCRIPT-INICIO -->
 <script>
 (function(){
@@ -1183,6 +1191,19 @@ let stockPendiente={}, stockSyncDesde=null;
 function registrarMovimientoStock(productId,delta){
   if(!productId||!delta) return;
   stockPendiente[productId]=(stockPendiente[productId]||0)+delta;
+}
+// Sincronización en tiempo real (Ably), solo negocio activo — mismo candado que stock arriba.
+// deviceId identifica a ESTE dispositivo (no la cuenta: dos teléfonos de la misma cuenta son
+// dos deviceId distintos), para que un dispositivo no reaplique su propio cambio al recibirlo
+// de vuelta. cambiosPendientes es la bitácora local a mandar a /cambios (misma idea que
+// stockPendiente arriba, pero en lista porque acá cada evento es distinto, no un delta que se
+// pueda sumar). cambiosSyncDesde es el cursor del SERVIDOR (id autoincremental de /cambios,
+// nunca la fecha) para ponerse al día tras estar desconectado, sin importar cuánto tiempo.
+let deviceId=null, cambiosPendientes=[], cambiosSyncDesde=null;
+let ablyClient=null, ablyChannel=null;
+function idDispositivo(){
+  if(!deviceId) deviceId=uuidLite();
+  return deviceId;
 }
 activeCurrency=(cfg.currOrder&&cfg.currOrder[0])||'bs';
 let saleType='pagado',fiarClientId=null,fiarQuery='',clientQuery='',expandedClientId=null,pedidosFilter='todos',expandedOrderId=null;
@@ -3179,6 +3200,7 @@ $('prodCatAdd').addEventListener('click',()=>{
   const id='cat_'+Date.now().toString(36);
   categories.push({id,label});
   fillCatSelect(id);
+  emitCambio('categoria',{id,label});
 });
 function openProductForm(){
   const p=editingProductId?products.find(x=>x.id===editingProductId):null;
@@ -3279,6 +3301,7 @@ $('prodSave').addEventListener('click',()=>{
   const extraFields={brand,sku,offerPrice,unitType,unitValueBase,ivaSubject,gastosPct,enCatalogoPublico,
     pricingMode,simplePrecio,simpleMoneda,simpleIvaIncluido,ventaPeso};
   const esNuevo=!editingProductId;
+  let prodGuardado=null;
   if(editingProductId){
     const p=products.find(x=>x.id===editingProductId);
     if(p){
@@ -3286,13 +3309,15 @@ $('prodSave').addEventListener('click',()=>{
       // próximo respaldo sube la nueva en vez de quedarse pegado con la que ya tenía en caché.
       if(p.photo!==prodPhotoData){ delete p.fotoRespaldoUrl; delete p.fotoRespaldoHash; }
       Object.assign(p,{name,cat,costBcv,margin,stock,calcMeta,photo:prodPhotoData},extraFields);
+      prodGuardado=p;
     }
   } else {
     // v1.8 — id único global (uuidLite), no secuencial por dispositivo: con multi-caja, dos
     // teléfonos generando 'p13' cada uno por su lado serían productos DISTINTOS con el MISMO
     // id, y el servidor sumaría su stock como si fueran el mismo producto. productSeq se deja
     // vivo (sigue en el respaldo) por compatibilidad con productos viejos, ya creados así.
-    products.push(Object.assign({id:'p_'+uuidLite(),name,cat,costBcv,margin,stock,calcMeta,photo:prodPhotoData},extraFields));
+    prodGuardado=Object.assign({id:'p_'+uuidLite(),name,cat,costBcv,margin,stock,calcMeta,photo:prodPhotoData},extraFields);
+    products.push(prodGuardado);
   }
   // catálogo maestro (v1.7 del backend) — si es un producto nuevo y no vino de un resultado
   // del buscador, se manda como sugerencia en silencio; si vino del buscador, ya existe ahí.
@@ -3306,6 +3331,7 @@ $('prodSave').addEventListener('click',()=>{
   $('productForm').style.display='none';
   editingProductId=null;
   renderCatalogo();renderGrid();renderChips();renderStock();
+  if(prodGuardado) emitCambio('producto',prodGuardado);
 });
 function catalogProductCardHTML(p){
   const pr=effectivePrices(p);
@@ -3372,6 +3398,7 @@ $('catalogoList').addEventListener('click',e=>{
       if(cart[id])delete cart[id]; // si estaba en el carrito activo, se saca también
       schedulePersist(true);
       renderCatalogo();renderCart();renderGrid();
+      emitCambio('producto_borrado',{id});
     });
   }
 });
@@ -5358,6 +5385,7 @@ $('contabilidadBody').addEventListener('click',e=>{
       // ese turno para que el arqueo lo descuente del efectivo esperado (ver turnoDesglose).
       origen
     };
+    let egresoGuardado=null;
     if(egresoEditId){
       const ex=egresos.find(x=>x.id===egresoEditId);
       if(ex){
@@ -5365,16 +5393,23 @@ $('contabilidadBody').addEventListener('click',e=>{
         // registró, aunque hoy haya otro turno abierto. Cambiarlo movería plata de un arqueo
         // ya cerrado a otro — misma regla de oro que congela costos al momento de la venta.
         Object.assign(ex,datos);
+        egresoGuardado=ex;
       }
     } else {
-      datos.id='e'+(egresoSeq++);
+      // id único global (uuidLite), no secuencial: mismo motivo que 'p_'+uuidLite() en
+      // productos (v1.8) — con sincronización entre dispositivos, dos teléfonos generando
+      // 'e12' cada uno por su lado serían egresos DISTINTOS con el MISMO id. egresoSeq se
+      // deja vivo (sigue en el respaldo) por compatibilidad con egresos viejos, ya creados así.
+      datos.id='e_'+uuidLite();
       datos.turnoId=(origen==='cajon'&&openTurno)?openTurno.id:null;
       egresos.push(datos);
+      egresoGuardado=datos;
     }
     contabFormOpen=false; egresoEditId=null;
     contabAccOpen=null; // pedido de Jonathan: al guardar, se cierra el acordeón y se ve toda la pantalla
     schedulePersist(true);
     renderContabilidad();
+    if(egresoGuardado) emitCambio('egreso',egresoGuardado);
     return;
   }
   const rm=e.target.closest('[data-rm-egreso]');
@@ -5385,6 +5420,7 @@ $('contabilidadBody').addEventListener('click',e=>{
       if(i>=0)egresos.splice(i,1);
       schedulePersist(true);
       renderContabilidad();
+      emitCambio('egreso_borrado',{id});
     });
     return;
   }
@@ -5669,6 +5705,7 @@ $('clientList').addEventListener('click',e=>{
       if(expandedClientId===cid)expandedClientId=null;
       renderClientes();
       if(currentSection==='porcobrar')renderPorCobrar();
+      emitCambio('cliente_borrado',{id:cid});
     });
     return;
   }
@@ -5685,9 +5722,14 @@ $('newClientCancel').addEventListener('click',()=>{$('newClientForm').style.disp
 $('newClientSave').addEventListener('click',()=>{
   const name=$('newClientName').value.trim();
   if(!name){$('newClientName').focus();return}
-  clients.push({id:'c'+(clientSeq++),name,phone:$('newClientPhone').value.trim(),idNumber:$('newClientIdNum').value.trim(),address:$('newClientAddress').value.trim()});
+  // id único global (uuidLite), no secuencial — mismo motivo que productos (v1.8): con
+  // sincronización entre dispositivos, dos teléfonos generando 'c101' cada uno por su lado
+  // serían clientes DISTINTOS con el MISMO id. clientSeq se deja vivo por compatibilidad.
+  const c={id:'c_'+uuidLite(),name,phone:$('newClientPhone').value.trim(),idNumber:$('newClientIdNum').value.trim(),address:$('newClientAddress').value.trim()};
+  clients.push(c);
   $('newClientForm').style.display='none';
   renderClientes();
+  emitCambio('cliente',c);
 });
 
 // ===== Confirmación genérica (sí/no) =====
@@ -6166,8 +6208,9 @@ $('fiarList').addEventListener('click',e=>{
   const b=e.target.closest('button');if(!b)return;
   if(b.dataset.new){
     const name=fiarQuery.trim();if(!name)return;
-    const c={id:'c'+(clientSeq++),name,phone:''};
+    const c={id:'c_'+uuidLite(),name,phone:''}; // id único global — ver nota en newClientSave
     clients.push(c);fiarClientId=c.id;fiarQuery='';$('fiarSearch').value='';
+    emitCambio('cliente',c);
   } else fiarClientId=b.dataset.id;
   renderFiarList();renderCart();
 });
@@ -6183,10 +6226,11 @@ $('fiarNewCancel').addEventListener('click',()=>{$('fiarNewForm').style.display=
 $('fiarNewSave').addEventListener('click',()=>{
   const name=$('fiarNewName').value.trim();
   if(!name){$('fiarNewName').focus();return}
-  const c={id:'c'+(clientSeq++),name,phone:$('fiarNewPhone').value.trim(),idNumber:$('fiarNewIdNum').value.trim(),address:$('fiarNewAddress').value.trim()};
+  const c={id:'c_'+uuidLite(),name,phone:$('fiarNewPhone').value.trim(),idNumber:$('fiarNewIdNum').value.trim(),address:$('fiarNewAddress').value.trim()}; // id único global — ver nota en newClientSave
   clients.push(c);fiarClientId=c.id;fiarQuery='';$('fiarSearch').value='';
   $('fiarNewForm').style.display='none';
   renderFiarList();renderCart();
+  emitCambio('cliente',c);
 });
 
 // ===== Identidad — Bienvenida / Iniciar sesión / Crear cuenta (v15, cuenta real desde v1.1 del backend) =====
@@ -6488,11 +6532,13 @@ function enterApp(firstTime){
   // hubiera entrado. Se repintan ya con la sesión en mano.
   try{ renderActivacion(); renderRespaldo(); renderPerfil(); renderCatalogoDigital(); }catch(e){}
   if(firstTime)setTimeout(startTour,350);
+  conectarTiempoReal(); // no-op seguro si no hay negocio activo, o si ya hay conexión abierta
 }
 document.querySelector('.out').addEventListener('click',()=>{
   authed=false; schedulePersist(true);
   authStep='welcome';renderAuth();
   $('authGate').classList.remove('hide');$('authGate').classList.remove('booting');closeDrawer();
+  desconectarTiempoReal();
 });
 renderAuth();
 
@@ -6755,6 +6801,10 @@ $('view-config').addEventListener('click',e=>{
   askConfirm('¿Guardar los cambios de "'+CFG_GROUP_NAMES[g]+'"?',async ()=>{
     cfgSnapshots[g]=captureGroup(g);
     schedulePersist(true);
+    // 'perfil' es dato de CUENTA (ver más abajo, sube por /perfil), no de negocio — no es algo
+    // que otro dispositivo del mismo negocio deba "heredar" en tiempo real como si fuera config
+    // de la tienda.
+    if(g!=='perfil') emitCambio('cfg',{group:g,snap:cfgSnapshots[g]});
     const tag=document.querySelector('.saved-tag[data-group="'+g+'"]');
     if(tag){tag.classList.add('show');setTimeout(()=>tag.classList.remove('show'),2200);}
     // v1.11 — "Mi perfil" no es solo local: vive en la cuenta, así que además de guardar en
@@ -6880,6 +6930,7 @@ function schedulePersist(immediate){
     idbSet('activeTheme',activeTheme);
     idbSet('payMethodsOn',payMethods.map(m=>({id:m.id,on:m.on})));
     idbSet('authed',authed);idbSet('signupData',signupData);
+    idbSet('deviceId',deviceId);idbSet('cambiosPendientes',cambiosPendientes);idbSet('cambiosSyncDesde',cambiosSyncDesde);
   };
   if(immediate){ run(); } else { persistTimer=setTimeout(run,400); }
 }
@@ -6903,7 +6954,7 @@ async function wipeLocalData(){
 
 async function initState(){
   try{
-    const keys=['products','clients','orders','cfg','categories','turnosCerrados','openTurno','orderSeq','clientSeq','turnoSeq','logoDataUrl','puntoToken','puntoNegocioId','productSeq','egresos','egresoSeq','activeTheme','payMethodsOn','authed','signupData','puntoAccountToken','stockPendiente','stockSyncDesde','puntoNegocioActivo','puntoAccountEmail','perfilCuenta','trialInfo','abonoPagos','ultimoRespaldoOk'];
+    const keys=['products','clients','orders','cfg','categories','turnosCerrados','openTurno','orderSeq','clientSeq','turnoSeq','logoDataUrl','puntoToken','puntoNegocioId','productSeq','egresos','egresoSeq','activeTheme','payMethodsOn','authed','signupData','puntoAccountToken','stockPendiente','stockSyncDesde','puntoNegocioActivo','puntoAccountEmail','perfilCuenta','trialInfo','abonoPagos','ultimoRespaldoOk','deviceId','cambiosPendientes','cambiosSyncDesde'];
     // ⚠️ Con tope de tiempo a propósito. idbGet() se queda esperando para siempre si el
     // almacenamiento del dispositivo no contesta (base bloqueada por otra pestaña, cuota llena,
     // WebView con el storage corrupto). Sin este tope, initState() nunca resuelve, el .then() de
@@ -6916,7 +6967,7 @@ async function initState(){
       new Promise(r=>setTimeout(()=>r(null),5000))
     ]);
     if(!vals) throw new Error('El almacenamiento del dispositivo no respondió');
-    const [sp,sc,so,scfg,scat,stc,sot,sos,scs,sts,slogo,stok,snid,spseq,seg,segseq,sth,spm,sauth,ssignup,sacct,sstockp,sstockd,snact,sacctEmail,sperfil,strial,sabonos,sultResp]=vals;
+    const [sp,sc,so,scfg,scat,stc,sot,sos,scs,sts,slogo,stok,snid,spseq,seg,segseq,sth,spm,sauth,ssignup,sacct,sstockp,sstockd,snact,sacctEmail,sperfil,strial,sabonos,sultResp,sdevid,scambp,scambd]=vals;
     // 'products' es const: se muta el array en su lugar en vez de reasignar la variable.
     // v4 — se chequea Array.isArray, no .length: una lista vacía es un estado guardado
     // válido (el negocio borró todo su catálogo, o todavía no ha vendido nada). Antes, con
@@ -6961,6 +7012,9 @@ async function initState(){
     revivirFechasRespaldo({orders,egresos,turnosCerrados,openTurno,abonoPagos});
     if(sstockp) stockPendiente=sstockp;
     if(sstockd) stockSyncDesde=sstockd;
+    if(sdevid) deviceId=sdevid;
+    if(Array.isArray(scambp)) cambiosPendientes=scambp;
+    if(scambd) cambiosSyncDesde=scambd;
   }catch(e){
     // sin IndexedDB (navegador viejo / algunos modos privados): sigue con los datos de
     // muestra de siempre, exactamente el comportamiento del mockup antes de v28.
@@ -7657,6 +7711,150 @@ async function sincronizarStock(){
   syncingStock=false;
 }
 
+// ---------- sincronización en tiempo real (Ably) ----------
+// Mismo candado que el stock de arriba: solo negocio activo (pago), esNegocioActivo() y no
+// esPremium() — la prueba gratis no incluye multi-dispositivo. Ably por sí solo es "dispara y
+// olvida": si el otro dispositivo está apagado o sin señal cuando se publica, se lo pierde para
+// siempre. Por eso emitCambio() hace DOS cosas: publica en vivo por Ably (si hay conexión, para
+// que se sienta instantáneo) Y lo manda a /cambios del servidor con reintento (igual criterio
+// que stockPendiente arriba) — esa segunda vía es la que de verdad garantiza que nada se pierde,
+// sin importar cuánto tiempo estuvo apagado el otro dispositivo, sin depender de ninguna ventana
+// de historial pagada de Ably.
+let syncingCambios=false;
+
+function emitCambio(tipo,payload){
+  if(!esNegocioActivo()) return; // gratis/trial: sin tiempo real, sin gasto de red de más
+  cambiosPendientes.push({tipo,payload,origen:idDispositivo()});
+  schedulePersist(true);
+  if(ablyChannel){
+    try{ ablyChannel.publish('cambio',{tipo,payload}); }catch(e){}
+  }
+  flushCambiosPendientes();
+}
+
+async function flushCambiosPendientes(){
+  if(!esNegocioActivo() || !puntoAccountToken || syncingCambios) return;
+  if(typeof navigator!=='undefined' && 'onLine' in navigator && !navigator.onLine) return;
+  if(!cambiosPendientes.length) return;
+  syncingCambios=true;
+  try{
+    // uno a la vez, en orden: si uno falla se corta ahí y el resto queda en cola para el
+    // próximo intento — mismo criterio "sin backoff, se reintenta con el próximo disparador"
+    // que syncPendingOrders/sincronizarStock arriba; el volumen de una bodega no pide más.
+    while(cambiosPendientes.length){
+      const c=cambiosPendientes[0];
+      const res=await fetch('/wp-json/punto/v1/cambios',{
+        method:'POST', headers:{'Content-Type':'application/json','Authorization':'Bearer '+puntoAccountToken},
+        body:JSON.stringify(c)
+      });
+      if(!res.ok) break;
+      cambiosPendientes.shift();
+    }
+    schedulePersist(true);
+  }catch(e){ /* sin internet — se reintenta en el próximo intento, sin bloquear nada */ }
+  syncingCambios=false;
+}
+
+async function ponerseAlDiaConCambios(){
+  if(!esNegocioActivo() || !puntoAccountToken) return;
+  try{
+    const qs=cambiosSyncDesde?('?desde='+encodeURIComponent(cambiosSyncDesde)):'';
+    const res=await fetch('/wp-json/punto/v1/cambios'+qs,{ headers:{'Authorization':'Bearer '+puntoAccountToken} });
+    const data=await res.json().catch(()=>null);
+    if(!res.ok || !data || !data.ok) return;
+    // el propio origen se salta: ya lo tenemos (lo publicamos nosotros mismos).
+    (data.cambios||[]).forEach(c=>{ if(c.origen!==idDispositivo()) aplicarCambioRemoto(c.tipo,c.payload); });
+    if(data.ultimo_id) cambiosSyncDesde=data.ultimo_id;
+    schedulePersist(true);
+  }catch(e){ /* sin internet — se reintenta en el próximo intento */ }
+}
+
+// Aplica un cambio llegado de OTRO dispositivo de la misma cuenta (por Ably en vivo, o al
+// ponerse al día con /cambios). El servidor no valida payload (mismo criterio que /sync y
+// /stock/mover: guarda, no interpreta) — cada rama revisa lo mínimo antes de tocar el estado
+// local, y un tipo desconocido se ignora sin más (una versión futura del cliente podría mandar
+// tipos que esta versión todavía no entiende, y eso no debe romper nada).
+function aplicarCambioRemoto(tipo,payload){
+  try{
+    if(!payload||typeof payload!=='object') return;
+    if(tipo==='cfg'){
+      // 'perfil' nunca llega hasta acá (ver emitCambio en el guardado de Configuración): es
+      // dato de CUENTA, no de negocio, y ya tiene su propio camino de sync (/perfil). Para el
+      // resto, applyGroup(g,snap) es la MISMA función que usa "descartar cambios sin guardar" —
+      // ya sabe que 'apariencia' vive en activeTheme (no cfg.theme), 'negocio' en logoDataUrl
+      // (no cfg.logo), 'cobros' en el arreglo payMethods (no cfg.pay), etc., y ya repinta lo
+      // que cada grupo necesita. Reimplementar ese mapeo acá a mano sería duplicar lógica y
+      // arriesgarse a que un campo quede mal aplicado.
+      if(!payload.group||!payload.snap) return;
+      applyGroup(payload.group,payload.snap);
+      cfgSnapshots[payload.group]=payload.snap; // re-ancla "sin guardar" contra el nuevo estado
+      schedulePersist(true);
+      return;
+    }
+    if(!payload.id) return; // el resto de los tipos son registros con id — sin id no hay qué aplicar
+    if(tipo==='producto'){
+      const i=products.findIndex(p=>p.id===payload.id);
+      if(i>=0) Object.assign(products[i],payload); else products.push(payload);
+      renderCatalogo();renderGrid();renderChips();renderStock();
+    } else if(tipo==='producto_borrado'){
+      const i=products.findIndex(p=>p.id===payload.id);
+      if(i>=0){ products.splice(i,1); renderCatalogo();renderCart();renderGrid(); }
+    } else if(tipo==='cliente'){
+      const i=clients.findIndex(c=>c.id===payload.id);
+      if(i>=0) Object.assign(clients[i],payload); else clients.push(payload);
+      renderClientes();renderFiarList();
+      if(currentSection==='porcobrar') renderPorCobrar();
+    } else if(tipo==='cliente_borrado'){
+      const i=clients.findIndex(c=>c.id===payload.id);
+      if(i>=0){ clients.splice(i,1); renderClientes(); if(currentSection==='porcobrar')renderPorCobrar(); }
+    } else if(tipo==='categoria'){
+      const i=categories.findIndex(c=>c.id===payload.id);
+      if(i>=0) Object.assign(categories[i],payload); else categories.push(payload);
+      renderChips();
+    } else if(tipo==='egreso'){
+      const i=egresos.findIndex(e=>e.id===payload.id);
+      if(i>=0) Object.assign(egresos[i],payload); else egresos.push(payload);
+      if(currentSection==='contabilidad') renderContabilidad();
+    } else if(tipo==='egreso_borrado'){
+      const i=egresos.findIndex(e=>e.id===payload.id);
+      if(i>=0){ egresos.splice(i,1); if(currentSection==='contabilidad')renderContabilidad(); }
+    } else {
+      return; // tipo desconocido: no toca nada ni reprograma el guardado
+    }
+    schedulePersist(true);
+  }catch(e){ /* un cambio remoto con forma rara no debe tumbar el POS */ }
+}
+
+// Conecta (o reconecta) el canal de tiempo real de este negocio. No-op seguro si: no hay
+// negocio activo (gratis/trial), no hay negocio_id todavía, no cargó el SDK de Ably (ver la
+// nota junto al <script src> en el <head> — el POS sigue funcionando igual sin él), o ya hay
+// una conexión abierta — así se puede llamar varias veces sin cuidado (login, boot,
+// reconexión) sin abrir conexiones duplicadas.
+function conectarTiempoReal(){
+  if(!esNegocioActivo() || !puntoAccountToken || !puntoNegocioId) return;
+  if(ablyClient) return;
+  if(typeof Ably==='undefined') return;
+  try{
+    ablyClient=new Ably.Realtime({
+      authUrl:'/wp-json/punto/v1/ably-token',
+      authMethod:'POST',
+      authHeaders:{'Authorization':'Bearer '+puntoAccountToken},
+      echoMessages:false // esta conexión no necesita recibir de vuelta lo que ella misma publicó
+    });
+    ablyChannel=ablyClient.channels.get('negocio-'+puntoNegocioId);
+    ablyChannel.subscribe('cambio',(msg)=>{
+      try{ aplicarCambioRemoto(msg.data.tipo,msg.data.payload); }catch(e){}
+    });
+    // cada (re)conexión es también el momento de ponerse al día por si acaso: Ably cubre huecos
+    // cortos solo, /cambios cubre cualquier hueco sin importar cuánto duró.
+    ablyClient.connection.on('connected',ponerseAlDiaConCambios);
+  }catch(e){ ablyClient=null; ablyChannel=null; }
+}
+function desconectarTiempoReal(){
+  if(ablyClient){ try{ ablyClient.close(); }catch(e){} }
+  ablyClient=null; ablyChannel=null;
+}
+
 // ---------- UI de Activación (Configuración → Negocio) ----------
 function renderActivacion(){
   const el=$('activacionEstado'); if(!el) return;
@@ -7876,11 +8074,17 @@ initState().then(()=>{
   if(typeof window!=='undefined'){
     window.addEventListener('online', syncPendingOrders);
     window.addEventListener('online', sincronizarStock);
+    window.addEventListener('online', conectarTiempoReal);
+    window.addEventListener('online', flushCambiosPendientes);
+    window.addEventListener('online', ponerseAlDiaConCambios);
     syncPendingOrders(); // intento silencioso al cargar, por si ya hay conexión y quedaron ventas pendientes
     sincronizarStock(); // idem — trae el stock real de las otras cajas apenas abre, si aplica
+    conectarTiempoReal(); // idem — reconecta el canal si el dispositivo ya estaba logueado (sesión restaurada, sin pasar por enterApp)
+    flushCambiosPendientes(); // por si quedó algo pendiente de mandar de la sesión anterior
     // cada 60s, no cada 4s como el autosave local: esto sí es una petición de red, no hay
     // que golpear el servidor a cada rato solo para preguntar "¿algo nuevo?" en dos cajas.
     setInterval(sincronizarStock, 60000);
+    setInterval(flushCambiosPendientes, 60000);
   }
 });
 })();
