@@ -2,6 +2,15 @@
 
 **Nota:** el producto pasó a llamarse **FrixPOS** (antes "Punto"). El historial de versiones de abajo queda tal como se escribió en su momento — donde diga "Punto" es solo el nombre viejo, el código y el comportamiento son los mismos.
 
+**v1.26 agrega la bitácora de cambios — la red de seguridad de v1.25 para cuando un dispositivo estuvo apagado o sin señal.**
+
+- **Por qué hacía falta:** Ably solo, "dispara y olvida", entrega el mensaje a quien esté conectado en ese instante. Si el otro dispositivo de la cuenta estaba apagado, ese cambio se perdía para siempre — sin importar la ventana de historial de Ably (que además depende del plan pagado en Ably, no de este servidor).
+- **`POST /wp-json/punto/v1/cambios`** — con `Authorization: Bearer <token de cuenta>`, exige negocio activo. Body `{origen, tipo, payload}`. El dispositivo que publica algo por Ably lo guarda acá EN PARALELO (mismo payload, tal cual) — el servidor no lo valida ni lo interpreta, solo lo guarda, igual que `/sync` y `/stock/mover`. Responde `{id}`: el cursor de esa fila.
+- **`GET /wp-json/punto/v1/cambios?desde=<id>`** — mismo Bearer, mismo candado. Devuelve los cambios con `id` mayor al cursor que mandes, en orden, más `ultimo_id` (el cursor a guardar para la próxima). **Sin `desde`, NO reproduce la bitácora completa** — el estado actual ya lo sirven `/stock`, `/respaldo`, etc.; esta bitácora es solo para ponerse al día tras una desconexión, no para el arranque inicial de un dispositivo nuevo.
+- **`origen`** identifica el DISPOSITIVO que publicó, no la cuenta — dos teléfonos de la misma cuenta son orígenes distintos. El cliente lo usa para no reaplicarse su propio cambio al ponerse al día.
+- **No es historial permanente.** Se poda a los últimos 500 cambios por negocio en cada inserción — es una red de seguridad de un rato desconectado, no un respaldo. Para eso ya existe `/respaldo`.
+- Tabla nueva `wp_punto_cambios`. `PUNTO_DB_VERSION` subió a 1.9 — se crea sola al activar/actualizar.
+
 **v1.25 agrega la sincronización en tiempo real entre dispositivos (Ably), solo para cuentas premium.**
 
 - **`POST /wp-json/punto/v1/ably-token`** — con `Authorization: Bearer <token de cuenta>`. Exige negocio activo (mismo candado que `/stock`); sin eso, 403 con `requiere_activacion:true`. Devuelve un `TokenDetails` de Ably (no la API Key) válido 1 hora, con permiso **solo** sobre el canal `negocio-{id}` de esa cuenta — ni ve ni puede tocar el canal de otro negocio.

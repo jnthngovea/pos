@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: FrixPOS — Backend
- * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual, stock sincronizado entre varias cajas (solo pago) y sincronización en tiempo real vía Ably entre dispositivos de una misma cuenta premium (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual, /stock y /ably-token, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
- * Version: 1.25
+ * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual, stock sincronizado entre varias cajas (solo pago) y sincronización en tiempo real vía Ably entre dispositivos de una misma cuenta premium, con bitácora de cambios como red de seguridad para cuando un dispositivo estuvo desconectado (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual, /stock, /ably-token y /cambios, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
+ * Version: 1.26
  * Author: FrixPOS
  * Requires PHP: 7.4
  *
@@ -39,7 +39,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit; // acceso directo al archivo, no.
 }
 
-define( 'PUNTO_DB_VERSION', '1.8' );
+define( 'PUNTO_DB_VERSION', '1.9' );
 define( 'PUNTO_BACKEND_DIR', plugin_dir_path( __FILE__ ) );
 
 /* ==========================================================================
@@ -64,6 +64,7 @@ function punto_tablas() {
 		'stock'            => $wpdb->prefix . 'punto_stock',
 		'catalogo_publico' => $wpdb->prefix . 'punto_catalogo_publico',
 		'solicitudes'      => $wpdb->prefix . 'punto_solicitudes',
+		'cambios'          => $wpdb->prefix . 'punto_cambios',
 	);
 }
 
@@ -237,6 +238,25 @@ function punto_instalar_tablas() {
 		creado_en DATETIME NOT NULL,
 		PRIMARY KEY  (id),
 		KEY atendida (atendida)
+	) $collate;" );
+
+	// cambios (v1.9 / plugin v1.26) — red de seguridad de la sincronización en tiempo real
+	// (Ably): el dispositivo que publica un cambio TAMBIÉN lo guarda aquí; si el que lo iba a
+	// recibir estaba apagado/sin señal, se pone al día pidiendo "qué pasó desde el cursor X" en
+	// vez de perder el cambio para siempre. Cursor = id autoincremental, nunca la fecha (dos
+	// filas pueden compartir el mismo segundo). 'origen' identifica el DISPOSITIVO que publicó
+	// (no la cuenta — dos teléfonos de la misma cuenta son orígenes distintos), para que ese
+	// mismo dispositivo se salte su propio cambio al ponerse al día. No es historial permanente:
+	// se poda a los últimos 500 por negocio (ver punto_api_cambios_guardar).
+	dbDelta( "CREATE TABLE {$t['cambios']} (
+		id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+		negocio_id BIGINT UNSIGNED NOT NULL,
+		origen VARCHAR(64) NOT NULL DEFAULT '',
+		tipo VARCHAR(40) NOT NULL DEFAULT '',
+		payload LONGTEXT NOT NULL,
+		creado_en DATETIME NOT NULL,
+		PRIMARY KEY  (id),
+		KEY negocio_id (negocio_id, id)
 	) $collate;" );
 
 	update_option( 'punto_db_version', PUNTO_DB_VERSION );
@@ -456,6 +476,23 @@ add_action( 'rest_api_init', function () {
 		'callback'            => 'punto_api_ably_token',
 		'permission_callback' => '__return_true', // la autorización se hace adentro, con el Bearer token de cuenta
 	) );
+
+	register_rest_route(
+		'punto/v1',
+		'/cambios',
+		array(
+			array(
+				'methods'             => 'POST',
+				'callback'            => 'punto_api_cambios_guardar',
+				'permission_callback' => '__return_true', // la autorización se hace adentro, con el Bearer token de cuenta
+			),
+			array(
+				'methods'             => 'GET',
+				'callback'            => 'punto_api_cambios_listar',
+				'permission_callback' => '__return_true',
+			),
+		)
+	);
 
 	register_rest_route(
 		'punto/v1',
@@ -1496,6 +1533,119 @@ function punto_api_ably_token( $request ) {
 
 	// $datos ya es el TokenDetails que espera el cliente Ably (token, expires, issued, ...).
 	return new WP_REST_Response( $datos, 200 );
+}
+
+/* ==========================================================================
+ * 3d-quinquies. BITÁCORA DE CAMBIOS PARA TIEMPO REAL (v1.26)
+ * ==========================================================================
+ * Ably por sí solo es "dispara y olvida": si el otro dispositivo está apagado
+ * o sin señal cuando se publica un mensaje, ese mensaje se pierde para
+ * siempre. Esta bitácora es la red de seguridad: el dispositivo que publica
+ * un cambio por Ably TAMBIÉN lo guarda aquí (mismo payload, sin validar ni
+ * interpretar — igual filosofía que /sync y /stock/mover); cuando el otro
+ * dispositivo vuelve a tener señal, pide "qué me perdí desde el cursor X" y
+ * se pone al día sin importar cuánto tiempo estuvo apagado.
+ *
+ * Mismo candado que /stock y /ably-token: exige negocio activo.
+ * ========================================================================== */
+
+function punto_api_cambios_guardar( $request ) {
+	global $wpdb;
+	$t = punto_tablas();
+
+	$cuenta = punto_cuenta_por_token( punto_token_de_request( $request ) );
+	if ( ! $cuenta ) {
+		return new WP_REST_Response( array( 'message' => 'Token de cuenta inválido. Inicia sesión de nuevo.' ), 401 );
+	}
+	$negocio_id = punto_negocio_id_de_cuenta( $cuenta->ID );
+	if ( ! $negocio_id ) {
+		return new WP_REST_Response( array( 'message' => 'La sincronización en tiempo real requiere un negocio activo.', 'requiere_activacion' => true ), 403 );
+	}
+
+	$body    = $request->get_json_params();
+	$origen  = isset( $body['origen'] ) ? substr( sanitize_text_field( $body['origen'] ), 0, 64 ) : '';
+	$tipo    = isset( $body['tipo'] ) ? substr( sanitize_text_field( $body['tipo'] ), 0, 40 ) : '';
+	$payload = isset( $body['payload'] ) ? wp_json_encode( $body['payload'] ) : '';
+	if ( '' === $tipo || '' === $payload ) {
+		return new WP_REST_Response( array( 'message' => 'Faltan datos del cambio.' ), 400 );
+	}
+
+	$wpdb->insert(
+		$t['cambios'],
+		array(
+			'negocio_id' => $negocio_id,
+			'origen'     => $origen,
+			'tipo'       => $tipo,
+			'payload'    => $payload,
+			'creado_en'  => current_time( 'mysql' ),
+		),
+		array( '%d', '%s', '%s', '%s', '%s' )
+	);
+	$id = (int) $wpdb->insert_id;
+
+	// Poda: esto es la red de seguridad de un rato desconectado, no un historial permanente
+	// (para eso ya existe /respaldo) — se quedan solo los últimos 500 cambios por negocio.
+	$cupo   = 500;
+	$cutoff = $wpdb->get_var( $wpdb->prepare(
+		"SELECT id FROM {$t['cambios']} WHERE negocio_id = %d ORDER BY id DESC LIMIT 1 OFFSET %d",
+		$negocio_id,
+		$cupo
+	) );
+	if ( $cutoff ) {
+		$wpdb->query( $wpdb->prepare(
+			"DELETE FROM {$t['cambios']} WHERE negocio_id = %d AND id <= %d",
+			$negocio_id,
+			(int) $cutoff
+		) );
+	}
+
+	return new WP_REST_Response( array( 'ok' => true, 'id' => $id ), 200 );
+}
+
+function punto_api_cambios_listar( $request ) {
+	global $wpdb;
+	$t = punto_tablas();
+
+	$cuenta = punto_cuenta_por_token( punto_token_de_request( $request ) );
+	if ( ! $cuenta ) {
+		return new WP_REST_Response( array( 'message' => 'Token de cuenta inválido. Inicia sesión de nuevo.' ), 401 );
+	}
+	$negocio_id = punto_negocio_id_de_cuenta( $cuenta->ID );
+	if ( ! $negocio_id ) {
+		return new WP_REST_Response( array( 'message' => 'La sincronización en tiempo real requiere un negocio activo.', 'requiere_activacion' => true ), 403 );
+	}
+
+	// Sin 'desde': NO se reproduce la bitácora completa, solo se ancla el cursor de arranque
+	// para la próxima vez. El estado ACTUAL ya lo trae /stock, /respaldo, etc. — esta bitácora
+	// es solo para ponerse al día tras estar desconectado, no para el arranque inicial.
+	$desde = $request->get_param( 'desde' );
+	$filas = array();
+	if ( $desde ) {
+		$filas = $wpdb->get_results( $wpdb->prepare(
+			"SELECT id, origen, tipo, payload, creado_en FROM {$t['cambios']} WHERE negocio_id = %d AND id > %d ORDER BY id ASC",
+			$negocio_id,
+			(int) $desde
+		) );
+		foreach ( $filas as &$fila ) {
+			$fila->id      = (int) $fila->id;
+			$fila->payload = json_decode( $fila->payload );
+		}
+		unset( $fila );
+	}
+
+	$ultimo_id = (int) $wpdb->get_var( $wpdb->prepare(
+		"SELECT MAX(id) FROM {$t['cambios']} WHERE negocio_id = %d",
+		$negocio_id
+	) );
+
+	return new WP_REST_Response(
+		array(
+			'ok'        => true,
+			'cambios'   => $filas,
+			'ultimo_id' => $ultimo_id,
+		),
+		200
+	);
 }
 
 /* ==========================================================================
