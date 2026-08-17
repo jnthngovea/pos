@@ -5318,6 +5318,7 @@ function updateEgresoFacturaBlock(){
   if(nota)nota.style.display=visible?'none':'';
 }
 $('contabilidadBody').addEventListener('click',e=>{
+  console.log('[FrixPOS/egreso] click en contabilidadBody, target:',e.target&&e.target.id,e.target&&e.target.className,'closest #egresoSave existe:',!!e.target.closest('#egresoSave'));
   const chip=e.target.closest('#contabChips .chip');
   if(chip){ contabRange=chip.dataset.r; renderContabilidad(); return; }
   if(e.target.closest('#egresoNewBtn')){ egresoEditId=null; contabFormOpen=true; contabAccOpen='egresos'; renderContabilidad(); return; }
@@ -5360,8 +5361,10 @@ $('contabilidadBody').addEventListener('click',e=>{
     return;
   }
   if(e.target.closest('#egresoSave')){
+    console.log('[FrixPOS/egreso] click en Guardar detectado');
     const amount=parseFloat($('egresoAmount').value)||0;
-    if(amount<=0){ $('egresoAmount').focus(); return; }
+    console.log('[FrixPOS/egreso] amount leido:',amount,'valor crudo del input:',$('egresoAmount')&&$('egresoAmount').value);
+    if(amount<=0){ console.log('[FrixPOS/egreso] se corta acá: amount<=0'); $('egresoAmount').focus(); return; }
     const cat=$('egresoCat').value;
     const currency=document.querySelector('#egresoCur button.on')?.dataset.v||'bs';
     const origen=document.querySelector('#egresoOrigen button.on')?.dataset.v||'cajon';
@@ -5405,11 +5408,22 @@ $('contabilidadBody').addEventListener('click',e=>{
       egresos.push(datos);
       egresoGuardado=datos;
     }
+    console.log('[FrixPOS/egreso] a punto de guardar. egresoGuardado:',egresoGuardado,'egresos.length antes:',egresos.length);
     contabFormOpen=false; egresoEditId=null;
     contabAccOpen=null; // pedido de Jonathan: al guardar, se cierra el acordeón y se ve toda la pantalla
     schedulePersist(true);
-    renderContabilidad();
-    if(egresoGuardado) emitCambio('egreso',egresoGuardado);
+    console.log('[FrixPOS/egreso] persistido. egresos.length ahora:',egresos.length,'a punto de renderContabilidad()');
+    try{
+      renderContabilidad();
+      console.log('[FrixPOS/egreso] renderContabilidad() terminó sin tirar error');
+    }catch(errRender){
+      console.error('[FrixPOS/egreso] renderContabilidad() TIRÓ UN ERROR (el egreso ya se guardó en memoria/IndexedDB, pero la pantalla no se pudo actualizar):',errRender);
+    }
+    if(egresoGuardado){
+      try{ emitCambio('egreso',egresoGuardado); }
+      catch(errEmit){ console.error('[FrixPOS/egreso] emitCambio() tiró un error:',errEmit); }
+    }
+    console.log('[FrixPOS/egreso] handler completo');
     return;
   }
   const rm=e.target.closest('[data-rm-egreso]');
