@@ -2,7 +2,7 @@
 /**
  * Plugin Name: FrixPOS — Backend
  * Description: Servidor de FrixPOS: negocios, códigos de activación, cuentas de dueño de negocio (registro/login/recuperar contraseña/perfil/prueba gratis de 60 días), Catálogo Digital público en /p/{slug} (gratis para todos), respaldo de ventas/catálogo/clientes con fotos (solo pago), catálogo maestro compartido, contabilidad mensual, stock sincronizado entre varias cajas (solo pago) y sincronización en tiempo real vía Ably entre dispositivos de una misma cuenta premium, con bitácora de cambios como red de seguridad para cuando un dispositivo estuvo desconectado (solo pago). Expone /activar, /sync, /registro, /login, /recuperar, /perfil, /catalogo-publico, /respaldo, /respaldo/foto, /catalogo-maestro, /contabilidad-mensual, /stock, /ably-token y /cambios, que la PWA del POS ya consume, y un panel en wp-admin para generar códigos, revisar negocios y el catálogo maestro.
- * Version: 1.27
+ * Version: 1.28
  * Author: FrixPOS
  * Requires PHP: 7.4
  *
@@ -1535,9 +1535,12 @@ function punto_api_ably_token( $request ) {
 
 	$jwt = punto_ably_jwt( $key_name, $key_secret, $capability, 'cuenta-' . $cuenta->ID, HOUR_IN_SECONDS );
 
-	// {token: ...} — formato que ably-js ya sabe leer desde authUrl (misma forma que un
-	// TokenDetails), sin depender de un Content-Type especial ni de una respuesta "en crudo".
-	return new WP_REST_Response( array( 'token' => $jwt ), 200 );
+	// El string PELADO, no {token: $jwt}: ably-js 2.x, al recibirlo por authUrl, revisa el
+	// objeto buscando 'keyName' (TokenRequest) o 'issued' (TokenDetails) — un objeto con solo
+	// 'token' no matchea ninguno de los dos y lo rechaza ("has neither a keyName nor an issued
+	// field", confirmado contra el SDK real). Mandado como string suelto, WP igual lo entrega
+	// como JSON válido (`"eyJ..."`, con comillas) y ably-js lo interpreta directo como el token.
+	return new WP_REST_Response( $jwt, 200 );
 }
 
 /* ==========================================================================

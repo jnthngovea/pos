@@ -8,6 +8,7 @@
 - **Ahora el token es un JWT firmado en este mismo servidor** (`punto_ably_jwt()`, HMAC-SHA256 con `hash_hmac()` de PHP puro — cero llamadas de red, cero librerías). Sigue siendo de 1 hora y con el mismo candado (negocio activo) y el mismo canal acotado (`negocio-{id}`); lo único que cambió es CÓMO se firma, no qué permisos da.
 - La API Key de Ably ya **no necesita el permiso "Token Request"** — con firmar localmente alcanza con que tenga Publish/Subscribe/Presence, que es lo que de verdad usa el canal.
 - Si esto vuelve a fallar, el error ya NO puede ser "mi servidor no puede salir a internet" — revisa la consola del navegador (los mensajes empiezan con `[FrixPOS/tiempo real]`) para lo que sigue.
+- **v1.28** — con el 502 resuelto apareció el siguiente error, ya del lado de Ably: *"Expected token request callback to call back with a token string... The returned object has neither a keyName nor an issued field"*. `/ably-token` mandaba `{token: $jwt}`; ably-js 2.x, al recibir un objeto por `authUrl`, busca `keyName` (TokenRequest) o `issued` (TokenDetails) para reconocer la forma — un objeto con solo `token` no matchea ninguna de las dos y lo rechaza. Se corrigió mandando el JWT como string suelto (`return new WP_REST_Response( $jwt, 200 )`), que WordPress igual entrega como JSON válido (con comillas) y que ably-js sí interpreta directo como el token.
 
 **v1.26 agrega la bitácora de cambios — la red de seguridad de v1.25 para cuando un dispositivo estuvo apagado o sin señal.**
 
