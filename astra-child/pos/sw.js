@@ -10,7 +10,7 @@
 // los teléfonos con la app ya instalada a limpiar el cache viejo la próxima vez que abran
 // con internet (ver 'activate' abajo) — si no, alguien podría quedarse pegado en una
 // versión vieja del POS aunque tenga señal.
-const PUNTO_SW_VERSION = 'v5_38';
+const PUNTO_SW_VERSION = 'v5_39';
 const CACHE_NAME = 'punto-pos-' + PUNTO_SW_VERSION;
 
 self.addEventListener('install', () => {
@@ -28,6 +28,11 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return; // no cachear POST/etc.
+  // deja pasar de largo cualquier esquema que no sea http(s) — ej. chrome-extension://, que
+  // alguna extensión del navegador puede hacer pasar por acá. La Cache API solo entiende
+  // http/https; sin este filtro, cache.put() tira una excepción sin capturar (y no es tráfico
+  // de esta app de todas formas, así que no hay nada que cachear ni servir offline).
+  if (!event.request.url.startsWith('http')) return;
   event.respondWith(
     caches.open(CACHE_NAME).then((cache) =>
       fetch(event.request)
